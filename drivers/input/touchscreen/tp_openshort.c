@@ -1,4 +1,5 @@
 #include <linux/kernel.h>
+#include <linux/fs.h>
 #include <linux/initrd.h>
 #include <linux/init.h>
 #include <linux/console.h>
@@ -92,26 +93,16 @@ static const struct file_operations tp_os_fops = {
 };
 
 //+OAK78,shenwenbin.wt,MOD,20211115,tuning double wakeup
-static ssize_t Double_WakeUp_read(struct file *file, char *buf,
+static ssize_t Double_WakeUp_read(struct file *file, char __user *buf,
 		size_t len, loff_t *pos)
 {
-	size_t count = 0;
-	char *temp_buf = NULL;
+	char temp_buf[sizeof("255\n")];
+	int count;
 
-	temp_buf = kcalloc(len, sizeof(char), GFP_KERNEL);
-	if (temp_buf != NULL) {
-			count = snprintf(temp_buf, PAGE_SIZE, "%d\n",
-					DoubleWakeUpEnable);
+	count = scnprintf(temp_buf, sizeof(temp_buf), "%d\n",
+			  READ_ONCE(DoubleWakeUpEnable));
 
-			if (copy_to_user(buf, temp_buf, len))
-			printk("%s, DoubleWakeUpEnable:%d\n", __func__, __LINE__);
-
-			kfree(temp_buf);
-	} else {
-			printk("%s, Failed to allocate memory\n", __func__);
-	}
-
-	return count;
+	return simple_read_from_buffer(buf, len, pos, temp_buf, count);
 }
 
 static ssize_t Double_WakeUp_write(struct file *file, const char *buff,
