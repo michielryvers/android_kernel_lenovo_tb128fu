@@ -1332,7 +1332,8 @@ static int msm_geni_serial_prep_dma_tx(struct uart_port *uport)
 	return ret;
 }
 
-static void __msm_geni_serial_start_tx(struct uart_port *uport)
+/* Return true only when a new TX owns the caller's runtime-PM reference. */
+static bool __msm_geni_serial_start_tx(struct uart_port *uport)
 {
 	unsigned int geni_m_irq_en;
 	struct msm_geni_serial_port *msm_port = GET_DEV_PORT(uport);
@@ -1363,9 +1364,9 @@ static void __msm_geni_serial_start_tx(struct uart_port *uport)
 		if (msm_port->tx_dma)
 			goto check_flow_ctrl;
 
-		msm_geni_serial_prep_dma_tx(uport);
+		return !msm_geni_serial_prep_dma_tx(uport) && msm_port->tx_dma;
 	}
-	return;
+	return true;
 check_flow_ctrl:
 	geni_ios = geni_read_reg_nolog(uport->membase, SE_GENI_IOS);
 	if (++ios_log_limit % 5 == 0) {
@@ -1373,12 +1374,12 @@ check_flow_ctrl:
 						__func__, geni_ios);
 		ios_log_limit = 0;
 	}
+	return false;
 }
 
 static void msm_geni_serial_start_tx(struct uart_port *uport)
 {
 	struct msm_geni_serial_port *port = GET_DEV_PORT(uport);
-	struct msm_geni_serial_port *msm_port = GET_DEV_PORT(uport);
 
 	port->last_activity = jiffies;
 
@@ -1389,22 +1390,20 @@ static void msm_geni_serial_start_tx(struct uart_port *uport)
 				msecs_to_jiffies(UART_VOTE_OFF_TIMEOUT_MS));
 	}
 
-	if (!uart_console(uport) && !pm_runtime_active(uport->dev)) {
-		IPC_LOG_MSG(msm_port->ipc_log_misc,
-				"%s.Putting in async RPM vote\n", __func__);
-		pm_runtime_get(uport->dev);
+	if (uart_console(uport)) {
+		__msm_geni_serial_start_tx(uport);
 		return;
 	}
 
-	if (!uart_console(uport)) {
-		IPC_LOG_MSG(msm_port->ipc_log_misc,
-				"%s.Power on.\n", __func__);
-		pm_runtime_get(uport->dev);
+	/* Pin the device before testing its state. A queued resume replays TX. */
+	pm_runtime_get(uport->dev);
+	if (!pm_runtime_active(uport->dev)) {
+		msm_geni_serial_power_off(uport);
+		return;
 	}
 
-	__msm_geni_serial_start_tx(uport);
-
-	if (!uart_console(uport))
+	/* A new transfer keeps this reference until TX done or cancellation. */
+	if (!__msm_geni_serial_start_tx(uport))
 		msm_geni_serial_power_off(uport);
 }
 
@@ -3973,8 +3972,12 @@ static int msm_geni_serial_runtime_resume(struct device *dev)
 	/* Replay stalled TX data if needed */
 	spin_lock_irqsave(&port->uport.lock, flags);
 	if (port->votes_enabled && port->uport.state &&
-	    uart_circ_chars_pending(&port->uport.state->xmit))
-		__msm_geni_serial_start_tx(&port->uport);
+	    uart_circ_chars_pending(&port->uport.state->xmit)) {
+		/* Resume may originate from RX/ioctl, which owns a separate vote. */
+		pm_runtime_get_noresume(dev);
+		if (!__msm_geni_serial_start_tx(&port->uport))
+			pm_runtime_put_noidle(dev);
+	}
 	spin_unlock_irqrestore(&port->uport.lock, flags);
 
 	/* Enable interrupt */
